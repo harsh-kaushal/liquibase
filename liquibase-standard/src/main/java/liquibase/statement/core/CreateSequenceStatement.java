@@ -17,6 +17,7 @@ public class CreateSequenceStatement extends AbstractSqlStatement {
     private Boolean cycle;
     private BigInteger cacheSize;
     private String dataType;
+    private String ownedBy;
 
     public CreateSequenceStatement(String catalogName, String schemaName, String sequenceName) {
         this.catalogName = catalogName;
@@ -113,6 +114,15 @@ public class CreateSequenceStatement extends AbstractSqlStatement {
 
     public CreateSequenceStatement setDataType(String dataType) {
         this.dataType = dataType;
+        return this;
+    }
+
+    public String getOwnedBy() {
+        return ownedBy;
+    }
+
+    public CreateSequenceStatement setOwnedBy(String ownedBy) {
+        this.ownedBy = ownedBy;
         return this;
     }
 }

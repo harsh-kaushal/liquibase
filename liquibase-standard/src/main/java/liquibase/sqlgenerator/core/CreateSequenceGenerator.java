@@ -40,6 +40,10 @@ public class CreateSequenceGenerator extends AbstractSqlGenerator<CreateSequence
 
         validationErrors.checkDisallowedField("ordered", statement.getOrdered(), database, HsqlDatabase.class, PostgresDatabase.class, MSSQLDatabase.class);
 
+        if (statement.getOwnedBy() != null && !(database instanceof PostgresDatabase)) {
+            validationErrors.addError("ownedBy is only supported on PostgreSQL");
+        }
+
         //check datatype
         if (database instanceof PostgresDatabase) {
             if (isPostgreWithoutAsDatatypeSupport(database)) {
@@ -132,6 +136,10 @@ public class CreateSequenceGenerator extends AbstractSqlGenerator<CreateSequence
             if (statement.getCycle()) {
                 queryStringBuilder.append(" CYCLE");
             }
+        }
+        
+        if (database instanceof PostgresDatabase && statement.getOwnedBy() != null) {
+            queryStringBuilder.append(" OWNED BY ").append(statement.getOwnedBy());
         }
 
         return new Sql[]{new UnparsedSql(queryStringBuilder.toString(), getAffectedSequence(statement))};

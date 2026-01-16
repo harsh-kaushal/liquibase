@@ -15,7 +15,10 @@ import liquibase.statement.core.RawParameterizedSqlStatement;
 import liquibase.structure.DatabaseObject;
 import liquibase.structure.core.Schema;
 import liquibase.structure.core.Sequence;
+import liquibase.structure.core.Table;
+import liquibase.structure.core.Column;
 
+import java.util.Locale;
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
@@ -30,13 +33,6 @@ public class SequenceSnapshotGenerator extends JdbcSnapshotGenerator {
         super(Sequence.class, new Class[]{Schema.class});
     }
 
-    private static final StringBuilder COMMON_PG_SEQUENCE_QUERY = new StringBuilder("JOIN pg_namespace ns on c.relnamespace = ns.oid ")
-            .append("LEFT JOIN pg_depend d ON c.oid = d.objid WHERE c.relkind = 'S' AND ns.nspname = 'SCHEMA_NAME' ")
-            .append("AND (c.oid not in (select ds.objid FROM pg_depend ds where ds.refobjsubid > 0) OR ( d.deptype = 'a' AND EXISTS ( ")
-            .append("select 1 from pg_attribute a JOIN pg_class t ON t.oid = d.refobjid AND a.attrelid=t.oid AND a.attnum=d.refobjsubid ")
-            .append("LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum ")
-            .append("WHERE a.atthasdef = false or not (pg_get_expr(ad.adbin, ad.adrelid) ilike '%' || c.relname || '%'))))");
-
     @Override
     protected void addTo(DatabaseObject foundObject, DatabaseSnapshot snapshot) throws DatabaseException, InvalidExampleException {
         if (!(foundObject instanceof Schema) || !snapshot.getDatabase().supports(Sequence.class)) {
@@ -50,7 +46,12 @@ public class SequenceSnapshotGenerator extends JdbcSnapshotGenerator {
 
         if (sequences != null) {
             for (Map<String, ?> sequence : sequences) {
-                schema.addDatabaseObject(mapToSequence(sequence, (Schema) foundObject, database));
+                Sequence seq = mapToSequence(sequence, schema, database);
+
+                if (isPurePostgresSerialSequence(database, snapshot, seq)) {
+                    continue; // ignore pure SERIAL sequences
+                }
+                schema.addDatabaseObject(seq);
             }
         }
     }
@@ -68,7 +69,7 @@ public class SequenceSnapshotGenerator extends JdbcSnapshotGenerator {
                     .queryForList(getSelectSequenceStatement(example.getSchema(), database));
             return getSequences(example, database, sequences);
         } else {
-            if (example.getAttribute("liquibase-complete", false)) { //need to go through "snapshotting" the object even if it was previously populated in addTo. Use the "liquibase-complete" attribute to track that it doesn't need to be fully snapshotted
+            if (example.getAttribute("liquibase-complete", false)) {
                 example.setSnapshotId(SnapshotIdService.getInstance().generateId());
                 example.setAttribute("liquibase-complete", null);
                 return example;
@@ -97,6 +98,8 @@ public class SequenceSnapshotGenerator extends JdbcSnapshotGenerator {
 
     private Sequence mapToSequence(Map<String, ?> sequenceRow, Schema schema, Database database) {
         String name = cleanNameFromDatabase((String) sequenceRow.get("SEQUENCE_NAME"), database);
+        String ownedTable = (String) sequenceRow.get("OWNED_TABLE");
+        String ownedColumn = (String) sequenceRow.get("OWNED_COLUMN");
         Sequence seq = new Sequence();
         seq.setName(name);
         seq.setSchema(schema);
@@ -112,40 +115,33 @@ public class SequenceSnapshotGenerator extends JdbcSnapshotGenerator {
         }
         seq.setAttribute("liquibase-complete", true);
 
+        if (ownedTable != null && ownedColumn != null) {
+            seq.setAttribute("ownedByTable", ownedTable);
+            seq.setAttribute("ownedByColumn", ownedColumn);
+        }
+
+        String dependencyType = (String) sequenceRow.get("DEPENDENCY_TYPE");
+        if (dependencyType != null) {
+            seq.setAttribute("dependencyType", dependencyType);
+        }
+
         return seq;
     }
 
     protected Boolean toBoolean(Object value, Database database) {
-        if (value == null) {
-            return null;
-        }
+        if (value == null) return null;
+        if (value instanceof Boolean) return (Boolean) value;
 
-        if (value instanceof Boolean) {
-            return (Boolean) value;
-        }
-
-        String valueAsString = value.toString();
-        valueAsString = valueAsString.replace("'", "");
-        if ("true".equalsIgnoreCase(valueAsString)
-                || "'true'".equalsIgnoreCase(valueAsString)
+        String valueAsString = value.toString().replace("'", "");
+        return "true".equalsIgnoreCase(valueAsString)
                 || "y".equalsIgnoreCase(valueAsString)
                 || "1".equalsIgnoreCase(valueAsString)
-                || "t".equalsIgnoreCase(valueAsString)) {
-            return Boolean.TRUE;
-        } else {
-            return Boolean.FALSE;
-        }
+                || "t".equalsIgnoreCase(valueAsString);
     }
 
     protected BigInteger toBigInteger(Object value, Database database) {
-        if (value == null) {
-            return null;
-        }
-
-        if (value instanceof BigInteger) {
-            return (BigInteger) value;
-        }
-
+        if (value == null) return null;
+        if (value instanceof BigInteger) return (BigInteger) value;
         return new BigInteger(value.toString());
     }
 
@@ -178,101 +174,98 @@ public class SequenceSnapshotGenerator extends JdbcSnapshotGenerator {
         } else if (database instanceof InformixDatabase) {
             return new RawParameterizedSqlStatement("SELECT tabname AS SEQUENCE_NAME FROM systables t, syssequences s WHERE s.tabid = t.tabid AND t.owner = ?", schema.getName());
         } else if (database instanceof OracleDatabase) {
-            /*
-             * Return an SQL statement that only returns the non-default values so the output changeLog is cleaner
-             * and less polluted with unnecessary values.
-             * The the following pages for the defaults (consistent for all supported releases ATM):
-             * 12cR2: http://docs.oracle.com/database/122/SQLRF/CREATE-SEQUENCE.htm
-             * 12cR1: http://docs.oracle.com/database/121/SQLRF/statements_6017.htm
-             * 11gR2: http://docs.oracle.com/cd/E11882_01/server.112/e41084/statements_6015.htm
-             */
             String catalogName = schema.getCatalogName();
             if (catalogName == null || catalogName.isEmpty()) {
                 catalogName = database.getDefaultCatalogName();
             }
-            StringBuilder sql = new StringBuilder("SELECT SEQUENCE_NAME, \n")
-                    .append("MIN_VALUE, \n")
-                    .append("MAX_VALUE, \n")
-                    .append("INCREMENT_BY, \n")
-                    .append("CYCLE_FLAG AS WILL_CYCLE, \n")
-                    .append("ORDER_FLAG AS IS_ORDERED, \n")
-                    .append("LAST_NUMBER as START_VALUE, \n")
-                    .append("CACHE_SIZE \n")
+            StringBuilder sql = new StringBuilder("SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CYCLE_FLAG AS WILL_CYCLE, ORDER_FLAG AS IS_ORDERED, LAST_NUMBER as START_VALUE, CACHE_SIZE ")
                     .append(String.format("FROM ALL_SEQUENCES WHERE SEQUENCE_OWNER = '%s'", catalogName));
             return new RawParameterizedSqlStatement(sql.toString());
         } else if (database instanceof PostgresDatabase) {
             int version = 9;
-            try {
-                version = database.getDatabaseMajorVersion();
-            } catch (Exception ignore) {
-                Scope.getCurrentScope().getLog(getClass()).warning("Failed to retrieve database version: " + ignore);
-            }
-            String schemaName = schema.getName();
-            if(schemaName == null) {
-                schemaName = database.getDefaultSchemaName();
-            }
-            String pgSequenceQuery = COMMON_PG_SEQUENCE_QUERY.toString().replace("SCHEMA_NAME", schemaName);
-            if (version < 10) { // 'pg_sequence' view does not exists yet
-                return new RawParameterizedSqlStatement(String.format("SELECT c.relname AS \"SEQUENCE_NAME\" FROM pg_class c %s", pgSequenceQuery));
+            try { version = database.getDatabaseMajorVersion(); } catch (Exception ignore) {}
+            String schemaName = schema.getName() == null ? database.getDefaultSchemaName() : schema.getName();
+
+            if (version < 10) {
+                return new RawParameterizedSqlStatement("SELECT c.relname AS \"SEQUENCE_NAME\" FROM pg_class c JOIN pg_namespace ns ON c.relnamespace = ns.oid WHERE c.relkind = 'S' AND ns.nspname = ?", schemaName);
             } else {
-                StringBuilder sql = new StringBuilder("SELECT c.relname AS \"SEQUENCE_NAME\", ")
-                        .append("  s.seqmin AS \"MIN_VALUE\", s.seqmax AS \"MAX_VALUE\", s.seqincrement AS \"INCREMENT_BY\", ")
-                        .append("  s.seqcycle AS \"WILL_CYCLE\", s.seqstart AS \"START_VALUE\", s.seqcache AS \"CACHE_SIZE\", ")
-                        .append("  pg_catalog.format_type(s.seqtypid, NULL) AS \"SEQ_TYPE\" ")
-                        .append("FROM pg_class c ")
-                        .append("JOIN pg_sequence s on c.oid = s.seqrelid ")
-                        .append(pgSequenceQuery);
-                return new RawParameterizedSqlStatement(sql.toString());
+                String sql = "SELECT c.relname AS \"SEQUENCE_NAME\", s.seqmin AS \"MIN_VALUE\", s.seqmax AS \"MAX_VALUE\", " +
+                        "s.seqincrement AS \"INCREMENT_BY\", s.seqcycle AS \"WILL_CYCLE\", s.seqstart AS \"START_VALUE\", " +
+                        "s.seqcache AS \"CACHE_SIZE\", pg_catalog.format_type(s.seqtypid, NULL) AS \"SEQ_TYPE\", " +
+                        "ref_c.relname AS \"OWNED_TABLE\", a.attname AS \"OWNED_COLUMN\", d.deptype AS \"DEPENDENCY_TYPE\" " +
+                        "FROM pg_class c JOIN pg_namespace ns ON c.relnamespace = ns.oid JOIN pg_sequence s ON c.oid = s.seqrelid " +
+                        "LEFT JOIN pg_depend d ON c.oid = d.objid AND d.deptype IN ('i', 'a', 'n') " +
+                        "LEFT JOIN pg_class ref_c ON d.refobjid = ref_c.oid AND ref_c.relkind = 'r' " +
+                        "LEFT JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid " +
+                        "WHERE c.relkind = 'S' AND ns.nspname = ? " +
+                        "AND (ref_c.relkind = 'r' OR d.objid IS NULL OR d.deptype IS NULL)";
+                return new RawParameterizedSqlStatement(sql, schemaName);
             }
         } else if (database instanceof MSSQLDatabase) {
             return getMSSQLQuery(schema);
         } else if (database instanceof MariaDBDatabase) {
             StringJoiner j = new StringJoiner(" \n UNION\n");
             try {
-                StringBuilder sql = new StringBuilder("select table_name AS SEQUENCE_NAME from information_schema.TABLES ")
-                        .append("where TABLE_SCHEMA = ? and TABLE_TYPE = 'SEQUENCE' order by table_name;");
-                List<Map<String, ?>> res = Scope.getCurrentScope().getSingleton(ExecutorService.class)
-                        .getExecutor("jdbc", database)
-                        .queryForList(new RawParameterizedSqlStatement(sql.toString(), schema.getName()));
-                if (res.size() == 0) {
-                    return new RawParameterizedSqlStatement("SELECT 'name' AS SEQUENCE_NAME from dual WHERE 1=0");
-                }
+                String sql = "select table_name AS SEQUENCE_NAME from information_schema.TABLES where TABLE_SCHEMA = ? and TABLE_TYPE = 'SEQUENCE' order by table_name;";
+                List<Map<String, ?>> res = Scope.getCurrentScope().getSingleton(ExecutorService.class).getExecutor("jdbc", database).queryForList(new RawParameterizedSqlStatement(sql, schema.getName()));
+                if (res.isEmpty()) return new RawParameterizedSqlStatement("SELECT 'name' AS SEQUENCE_NAME from dual WHERE 1=0");
                 for (Map<String, ?> e : res) {
                     String seqName = (String) e.get("SEQUENCE_NAME");
-                    j.add(String.format("SELECT '%s' AS SEQUENCE_NAME, " +
-                            "START_VALUE AS START_VALUE, " +
-                            "MINIMUM_VALUE AS MIN_VALUE, " +
-                            "MAXIMUM_VALUE AS MAX_VALUE, " +
-                            "INCREMENT AS INCREMENT_BY, " +
-                            "CYCLE_OPTION AS WILL_CYCLE " +
-                            "FROM %s ", seqName, seqName));
+                    j.add(String.format("SELECT '%s' AS SEQUENCE_NAME, START_VALUE, MINIMUM_VALUE AS MIN_VALUE, MAXIMUM_VALUE AS MAX_VALUE, INCREMENT AS INCREMENT_BY, CYCLE_OPTION AS WILL_CYCLE FROM %s ", seqName, seqName));
                 }
             } catch (DatabaseException e) {
-                throw new UnexpectedLiquibaseException("Could not get list of schemas ", e);
+                throw new UnexpectedLiquibaseException("Could not get list of sequences", e);
             }
             return new RawParameterizedSqlStatement(j.toString());
         } else if (database instanceof SybaseASADatabase) {
-            StringBuilder sql = new StringBuilder("SELECT SEQUENCE_NAME, START_WITH AS START_VALUE, MIN_VALUE, ")
-                    .append("MAX_VALUE, INCREMENT_BY, CYCLE AS WILL_CYCLE FROM SYS.SYSSEQUENCE s JOIN SYS.SYSUSER u ON s.OWNER = u.USER_ID ")
-                    .append("WHERE u.USER_NAME = ?");
-            return new RawParameterizedSqlStatement( sql.toString(), schema.getName());
-        } else if (database.getClass().getName().contains("MaxDB")) { //have to check classname as this is currently an extension
-            return new RawParameterizedSqlStatement("SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CYCLE_FLAG AS WILL_CYCLE " +
-                    "FROM sequences WHERE SCHEMANAME = ?", schema.getName());
+            String sql = "SELECT SEQUENCE_NAME, START_WITH AS START_VALUE, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CYCLE AS WILL_CYCLE FROM SYS.SYSSEQUENCE s JOIN SYS.SYSUSER u ON s.OWNER = u.USER_ID WHERE u.USER_NAME = ?";
+            return new RawParameterizedSqlStatement(sql, schema.getName());
+        } else if (database.getClass().getName().contains("MaxDB")) {
+            return new RawParameterizedSqlStatement("SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CYCLE_FLAG AS WILL_CYCLE FROM sequences WHERE SCHEMANAME = ?", schema.getName());
         } else {
             throw new UnexpectedLiquibaseException("Don't know how to query for sequences on " + database);
         }
     }
 
     private static RawParameterizedSqlStatement getMSSQLQuery(Schema schema) {
-        String sql = "SELECT SEQUENCE_NAME, START_VALUE, MINIMUM_VALUE AS MIN_VALUE, " +
-                "MAXIMUM_VALUE AS MAX_VALUE, INCREMENT AS INCREMENT_BY, CYCLE_OPTION AS WILL_CYCLE, " +
-                // If we have a decimal sequence we want to include the precision with the data type.
-                // This is not necessary with types like bigint. Previously we did not include the data type
-                // in our query which would create the sequence with data type bigint. So we normalize all other
-                // non-decimal seq_type values to null.
-                "IIF(DATA_TYPE = 'decimal', DATA_TYPE + '(' + CAST(NUMERIC_PRECISION AS VARCHAR) + ')', NULL) AS SEQ_TYPE " +
-                "FROM INFORMATION_SCHEMA.SEQUENCES WHERE SEQUENCE_SCHEMA = ?";
+        String sql = "SELECT SEQUENCE_NAME, START_VALUE, MINIMUM_VALUE AS MIN_VALUE, MAXIMUM_VALUE AS MAX_VALUE, INCREMENT AS INCREMENT_BY, CYCLE_OPTION AS WILL_CYCLE, IIF(DATA_TYPE = 'decimal', DATA_TYPE + '(' + CAST(NUMERIC_PRECISION AS VARCHAR) + ')', NULL) AS SEQ_TYPE FROM INFORMATION_SCHEMA.SEQUENCES WHERE SEQUENCE_SCHEMA = ?";
         return new RawParameterizedSqlStatement(sql, schema.getName());
+    }
+
+    private boolean isPurePostgresSerialSequence(Database database, DatabaseSnapshot snapshot, Sequence seq) {
+        if (!(database instanceof PostgresDatabase)) return false;
+
+        String ownedTable = seq.getAttribute("ownedByTable", String.class);
+        String ownedColumn = seq.getAttribute("ownedByColumn", String.class);
+
+        // If it has no owner, it's an explicit sequence (keep it)
+        if (ownedTable == null || ownedColumn == null) return false;
+
+        // Check naming convention
+        String standardName = (ownedTable + "_" + ownedColumn + "_seq").toLowerCase(Locale.ROOT);
+        boolean matchesStandardName = seq.getName().toLowerCase(Locale.ROOT).equals(standardName);
+
+        // If it's owned by a DIFFERENT table than its name suggests (your fix!), keep it
+        if (!matchesStandardName) {
+            return false;
+        }
+
+        // Now, for sequences that DO match the name (like serial_default_id_seq)
+        // We check if the column actually uses it as a DEFAULT nextval(...)
+        Table table = (Table) snapshot.get(new Table().setName(ownedTable).setSchema(seq.getSchema()));
+        if (table == null) return false;
+
+        Column column = table.getColumn(ownedColumn);
+        if (column == null) return false;
+
+        Object defaultValue = column.getDefaultValue();
+        if (defaultValue == null) return false;
+
+        // Use toString() which handles DatabaseFunction or String values
+        String defaultExpr = defaultValue.toString().toLowerCase(Locale.ROOT);
+        
+        // If the column default looks like: nextval('serial_default_id_seq'::regclass)
+        // then it's a "Pure" serial and we should return TRUE to ignore it.
+        return defaultExpr.contains("nextval") && defaultExpr.contains(seq.getName().toLowerCase(Locale.ROOT));
     }
 }

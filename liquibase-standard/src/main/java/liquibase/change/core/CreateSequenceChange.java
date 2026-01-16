@@ -28,6 +28,7 @@ public class CreateSequenceChange extends AbstractChange {
     private Boolean cycle;
     private BigInteger cacheSize;
     private String dataType;
+    private String ownedBy;
 
     @DatabaseChangeProperty(since = "3.0", description = "Name of the database catalog")
     public String getCatalogName() {
@@ -84,6 +85,18 @@ public class CreateSequenceChange extends AbstractChange {
         return dataType;
     }
 
+    @DatabaseChangeProperty(
+        description = "Table and column that owns this sequence (PostgreSQL specific). Format: table_name.column_name",
+        since = "5.0"
+    )
+    public String getOwnedBy() {
+        return ownedBy;
+    }
+
+    public void setOwnedBy(String ownedBy) {
+        this.ownedBy = ownedBy;
+    }
+
     @Override
     public SqlStatement[] generateStatements(Database database) {
         return new SqlStatement[] {
@@ -96,6 +109,7 @@ public class CreateSequenceChange extends AbstractChange {
                 .setCycle(getCycle())
                 .setCacheSize(getCacheSize())
                 .setDataType(getDataType())
+                .setOwnedBy(getOwnedBy())
         };
     }
 
@@ -126,6 +140,15 @@ public class CreateSequenceChange extends AbstractChange {
                 }
                 if (getDataType() != null) {
                     result.assertCorrect(getDataType().equals(sequence.getDataType()), "Data type is different");
+                }
+                if (getOwnedBy() != null) {
+                    String currentOwner = null;
+                    String table = (String) sequence.getAttribute("ownedByTable", String.class);
+                    String column = (String) sequence.getAttribute("ownedByColumn", String.class);
+                    if (table != null && column != null) {
+                        currentOwner = table + "." + column;
+                    }
+                    result.assertCorrect(getOwnedBy().equalsIgnoreCase(currentOwner), "Ownership is different");
                 }
             }
         } catch (Exception e) {

@@ -51,6 +51,14 @@ public class MissingSequenceChangeGenerator extends AbstractChangeGenerator impl
         change.setOrdered(sequence.getOrdered());
         change.setDataType(sequence.getDataType());
 
+        String ownedTable = sequence.getAttribute("ownedByTable", String.class);
+        System.out.println("DEBUG: Sequence " + sequence.getName() + " has ownedTable: " + ownedTable);
+        String ownedColumn = sequence.getAttribute("ownedByColumn", String.class);
+
+        if (ownedTable != null && ownedColumn != null) {
+            change.setOwnedBy(ownedTable + "." + ownedColumn);
+        }
+
         return new Change[] { change };
 
     }
